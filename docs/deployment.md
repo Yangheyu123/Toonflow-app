@@ -39,11 +39,10 @@ GitHub Runner：打包指定提交并通过 SSH 上传到服务器
 | `DEPLOY_SSH_PORT` | SSH 端口，通常为 `22`。 |
 | `DEPLOY_SSH_USER` | 专用部署账号。 |
 | `DEPLOY_SSH_KEY` | 部署私钥的完整内容。 |
-| `DEPLOY_SSH_FINGERPRINT` | SSH 主机 ED25519 公钥的 SHA-256 指纹。 |
 
 不要将 SSH 密码写入 Actions Secrets、工作流、仓库文件或命令历史。建议创建仅用于部署的 SSH 密钥，并为其设置最小权限。
 
-在可信网络中可通过以下命令获取主机指纹，并把输出中的 `SHA256:...` 写入 `DEPLOY_SSH_FINGERPRINT`：
+工作流会固定校验服务器的 ED25519 主机公钥指纹。该指纹是公开的身份标识，不属于 Secret；服务器更换 SSH 主机密钥时，需要在工作流中同步更新。可在可信网络中使用以下命令核对：
 
 ```bash
 ssh-keyscan -t ed25519 <server-host> | ssh-keygen -lf - -E sha256

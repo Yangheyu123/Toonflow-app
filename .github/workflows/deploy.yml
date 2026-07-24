@@ -26,87 +26,85 @@ jobs:
       - name: Create source archive
         run: git archive --format=tar.gz --output=toonflow-release.tar.gz "${GITHUB_SHA}"
 
+      - name: Configure verified SSH connection
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/toonflow_deploy
+          chmod 600 ~/.ssh/toonflow_deploy
+          cat > ~/.ssh/known_hosts <<'EOF'
+          101.96.224.33 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJGxYfl4kpLVAmeAjyHPG8nl6l1Vr4evBDKuqx9bHdHF
+          EOF
+          ssh-keygen -F "$DEPLOY_HOST" -f ~/.ssh/known_hosts
+
       - name: Prepare release directory
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_SSH_HOST }}
-          port: ${{ secrets.DEPLOY_SSH_PORT }}
-          username: ${{ secrets.DEPLOY_SSH_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          # 主机公钥指纹不是机密；固定在此处可避免 Secret 的格式或环境覆盖问题。
-          fingerprint: SHA256:68k+Y14hY9k68+zgzW7XgcXvBw4saIsaTWFP3uXoRlA
-          script: mkdir -p /data/apps/toonflow-app/releases
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_SSH_USER }}
+        run: |
+          ssh -p "$DEPLOY_PORT" -i ~/.ssh/toonflow_deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" 'mkdir -p /data/apps/toonflow-app/releases'
 
       - name: Upload source archive
-        uses: appleboy/scp-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_SSH_HOST }}
-          port: ${{ secrets.DEPLOY_SSH_PORT }}
-          username: ${{ secrets.DEPLOY_SSH_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          fingerprint: SHA256:68k+Y14hY9k68+zgzW7XgcXvBw4saIsaTWFP3uXoRlA
-          source: toonflow-release.tar.gz
-          target: /data/apps/toonflow-app/releases
-          overwrite: true
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_SSH_USER }}
+        run: |
+          scp -P "$DEPLOY_PORT" -i ~/.ssh/toonflow_deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes toonflow-release.tar.gz "$DEPLOY_USER@$DEPLOY_HOST:/data/apps/toonflow-app/releases/toonflow-release.tar.gz"
 
       - name: Switch release and verify health
-        uses: appleboy/ssh-action@v1
         env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_SSH_USER }}
           DEPLOY_SHA: ${{ github.sha }}
-        with:
-          host: ${{ secrets.DEPLOY_SSH_HOST }}
-          port: ${{ secrets.DEPLOY_SSH_PORT }}
-          username: ${{ secrets.DEPLOY_SSH_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          fingerprint: SHA256:68k+Y14hY9k68+zgzW7XgcXvBw4saIsaTWFP3uXoRlA
-          envs: DEPLOY_SHA
-          command_timeout: 20m
-          script: |
-            set -euo pipefail
+        run: |
+          ssh -p "$DEPLOY_PORT" -i ~/.ssh/toonflow_deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" "DEPLOY_SHA=$DEPLOY_SHA bash -s" <<'REMOTE'
+          set -euo pipefail
 
-            app_root=/data/apps/toonflow-app
-            app_dir="$app_root/app"
-            releases_dir="$app_root/releases"
-            archive="$releases_dir/toonflow-release.tar.gz"
-            release_dir="$releases_dir/$DEPLOY_SHA"
-            previous_dir="$releases_dir/app-before-$DEPLOY_SHA"
-            failed_dir="$releases_dir/app-failed-$DEPLOY_SHA"
+          app_root=/data/apps/toonflow-app
+          app_dir="$app_root/app"
+          releases_dir="$app_root/releases"
+          archive="$releases_dir/toonflow-release.tar.gz"
+          release_dir="$releases_dir/$DEPLOY_SHA"
+          previous_dir="$releases_dir/app-before-$DEPLOY_SHA"
+          failed_dir="$releases_dir/app-failed-$DEPLOY_SHA"
 
-            test -f "$archive"
-            test -f "$app_dir/Dockerfile.production"
+          test -f "$archive"
+          test -f "$app_dir/Dockerfile.production"
+          mkdir -p "$release_dir"
+          tar -xzf "$archive" -C "$release_dir"
+          cp "$app_dir/Dockerfile.production" "$release_dir/Dockerfile.production"
 
-            mkdir -p "$release_dir"
-            tar -xzf "$archive" -C "$release_dir"
-            cp "$app_dir/Dockerfile.production" "$release_dir/Dockerfile.production"
+          mv "$app_dir" "$previous_dir"
+          mv "$release_dir" "$app_dir"
 
-            mv "$app_dir" "$previous_dir"
-            mv "$release_dir" "$app_dir"
-
-            rollback() {
-              echo "Deployment failed; restoring the previous release."
-              mv "$app_dir" "$failed_dir" || true
-              mv "$previous_dir" "$app_dir" || true
-              cd "$app_root"
-              docker compose up -d --build || true
-            }
-            trap rollback ERR
-
-            # The persistent /app/data volume shadows image data. Update the tracked
-            # runtime resources while retaining files absent from the release archive.
-            cp -a "$app_dir/data/." "$app_root/volumes/data/"
-
+          rollback() {
+            echo "Deployment failed; restoring the previous release."
+            mv "$app_dir" "$failed_dir" || true
+            mv "$previous_dir" "$app_dir" || true
             cd "$app_root"
-            docker compose build
-            docker compose up -d --remove-orphans
+            docker compose up -d --build || true
+          }
+          trap rollback ERR
 
-            for attempt in $(seq 1 30); do
-              if curl --fail --silent --show-error http://127.0.0.1:10588/ > /dev/null; then
-                docker compose ps
-                echo "Deployment succeeded: $DEPLOY_SHA"
-                exit 0
-              fi
-              sleep 2
-            done
+          cp -a "$app_dir/data/." "$app_root/volumes/data/"
+          cd "$app_root"
+          docker compose build
+          docker compose up -d --remove-orphans
 
-            echo "Deployment failed: service did not become healthy."
-            exit 1
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:10588/ > /dev/null; then
+              docker compose ps
+              echo "Deployment succeeded: $DEPLOY_SHA"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Deployment failed: service did not become healthy."
+          exit 1
+          REMOTE

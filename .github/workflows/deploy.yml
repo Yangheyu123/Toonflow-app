@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: toonflow-production-deploy
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   deploy:
@@ -19,7 +19,37 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Update application and verify health
+      - name: Check out the triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Create source archive
+        run: git archive --format=tar.gz --output=toonflow-release.tar.gz "${GITHUB_SHA}"
+
+      - name: Prepare release directory
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          port: ${{ secrets.DEPLOY_SSH_PORT }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ secrets.DEPLOY_SSH_FINGERPRINT }}
+          script: mkdir -p /data/apps/toonflow-app/releases
+
+      - name: Upload source archive
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          port: ${{ secrets.DEPLOY_SSH_PORT }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ secrets.DEPLOY_SSH_FINGERPRINT }}
+          source: toonflow-release.tar.gz
+          target: /data/apps/toonflow-app/releases
+          overwrite: true
+
+      - name: Switch release and verify health
         uses: appleboy/ssh-action@v1
         env:
           DEPLOY_SHA: ${{ github.sha }}
@@ -36,38 +66,34 @@ jobs:
 
             app_root=/data/apps/toonflow-app
             app_dir="$app_root/app"
+            releases_dir="$app_root/releases"
+            archive="$releases_dir/toonflow-release.tar.gz"
+            release_dir="$releases_dir/$DEPLOY_SHA"
+            previous_dir="$releases_dir/app-before-$DEPLOY_SHA"
+            failed_dir="$releases_dir/app-failed-$DEPLOY_SHA"
 
-            cd "$app_dir"
+            test -f "$archive"
+            test -f "$app_dir/Dockerfile.production"
 
-            # Do not hide server-side source edits behind an automated reset.
-            if ! git diff --ignore-space-at-eol --quiet; then
-              echo "Deployment stopped: server worktree has content changes."
-              exit 1
-            fi
+            mkdir -p "$release_dir"
+            tar -xzf "$archive" -C "$release_dir"
+            cp "$app_dir/Dockerfile.production" "$release_dir/Dockerfile.production"
 
-            unexpected_files="$(git ls-files --others --exclude-standard | grep -v '^Dockerfile.production$' || true)"
-            if [ -n "$unexpected_files" ]; then
-              echo "Deployment stopped: unexpected untracked files found:"
-              printf '%s\n' "$unexpected_files"
-              exit 1
-            fi
+            mv "$app_dir" "$previous_dir"
+            mv "$release_dir" "$app_dir"
 
-            git fetch --depth 1 origin master
-            remote_sha="$(git rev-parse origin/master)"
-            if [ "$remote_sha" != "$DEPLOY_SHA" ]; then
-              echo "Deployment stopped: origin/master ($remote_sha) does not match triggering commit ($DEPLOY_SHA)."
-              exit 1
-            fi
+            rollback() {
+              echo "Deployment failed; restoring the previous release."
+              mv "$app_dir" "$failed_dir" || true
+              mv "$previous_dir" "$app_dir" || true
+              cd "$app_root"
+              docker compose up -d --build || true
+            }
+            trap rollback ERR
 
-            git checkout -f master
-            git reset --hard "$DEPLOY_SHA"
-
-            # Docker Compose references this host-maintained production Dockerfile.
-            test -f Dockerfile.production
-
-            # The persistent /app/data volume shadows image data. Keep the existing
-            # deployment behavior by updating tracked runtime resources in that volume.
-            cp -a data/. "$app_root/volumes/data/"
+            # The persistent /app/data volume shadows image data. Update the tracked
+            # runtime resources while retaining files absent from the release archive.
+            cp -a "$app_dir/data/." "$app_root/volumes/data/"
 
             cd "$app_root"
             docker compose build
@@ -83,6 +109,4 @@ jobs:
             done
 
             echo "Deployment failed: service did not become healthy."
-            docker compose ps
-            docker compose logs --tail 100 toonflow-app
             exit 1

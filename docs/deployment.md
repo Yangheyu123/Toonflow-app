@@ -9,7 +9,10 @@ git push origin master
 GitHub Actions
         |
         v
-SSH 服务器：拉取指定提交、构建 Docker 镜像、重启 Compose 服务、执行 HTTP 健康检查
+GitHub Runner：打包指定提交并通过 SSH 上传到服务器
+        |
+        v
+服务器：切换发布目录、构建 Docker 镜像、重启 Compose 服务、执行 HTTP 健康检查
 ```
 
 ## 部署前提
@@ -18,9 +21,10 @@ SSH 服务器：拉取指定提交、构建 Docker 镜像、重启 Compose 服�
 
 ```text
 /data/apps/toonflow-app/
-  app/                    Git 工作区
+  app/                    当前运行版本的源码目录
   docker-compose.yml      生产 Compose 配置
   volumes/data/           持久化应用数据
+  releases/               已部署、失败和待发布的源码归档
 ```
 
 工作流假定 `app/Dockerfile.production` 为服务器维护的生产 Dockerfile，不会删除它。`volumes/data/` 会挂载到容器的 `/app/data`，因此其中的项目数据、上传文件和本地配置应纳入备份策略。
@@ -60,14 +64,13 @@ curl --fail http://127.0.0.1:10588/
 
 ## 安全机制与失败处理
 
-部署工作流会在下列情况中止：
+部署工作流会在下列情况中止并恢复上一版本：
 
-- 服务器 Git 工作区存在非行尾差异的内容修改；
-- 存在除 `Dockerfile.production` 外的未跟踪文件；
-- 远程 `master` 的提交与触发 Actions 的提交不一致；
+- 服务器缺少待上传的源码归档或 `Dockerfile.production`；
+- Docker Compose 构建或启动失败；
 - Docker Compose 启动后 60 秒内未通过本机 HTTP 健康检查。
 
-失败后，先通过 Actions 日志确认原因。需要回滚时，在 GitHub 中选择已验证的历史提交并执行新的部署；不要直接在服务器工作区修改源码。
+工作流由 GitHub Runner 下载提交并通过 SCP 上传，因此服务器不需要访问 GitHub。失败后，先通过 Actions 日志确认原因；工作流会保留失败版本和上一版本在 `releases/` 目录中，便于排查与手动回滚。
 
 ## 日常发布流程
 

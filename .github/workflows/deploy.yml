@@ -1,0 +1,88 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toonflow-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to production server
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Update application and verify health
+        uses: appleboy/ssh-action@v1
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          port: ${{ secrets.DEPLOY_SSH_PORT }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ secrets.DEPLOY_SSH_FINGERPRINT }}
+          envs: DEPLOY_SHA
+          command_timeout: 20m
+          script: |
+            set -euo pipefail
+
+            app_root=/data/apps/toonflow-app
+            app_dir="$app_root/app"
+
+            cd "$app_dir"
+
+            # Do not hide server-side source edits behind an automated reset.
+            if ! git diff --ignore-space-at-eol --quiet; then
+              echo "Deployment stopped: server worktree has content changes."
+              exit 1
+            fi
+
+            unexpected_files="$(git ls-files --others --exclude-standard | grep -v '^Dockerfile.production$' || true)"
+            if [ -n "$unexpected_files" ]; then
+              echo "Deployment stopped: unexpected untracked files found:"
+              printf '%s\n' "$unexpected_files"
+              exit 1
+            fi
+
+            git fetch --depth 1 origin master
+            remote_sha="$(git rev-parse origin/master)"
+            if [ "$remote_sha" != "$DEPLOY_SHA" ]; then
+              echo "Deployment stopped: origin/master ($remote_sha) does not match triggering commit ($DEPLOY_SHA)."
+              exit 1
+            fi
+
+            git checkout -f master
+            git reset --hard "$DEPLOY_SHA"
+
+            # Docker Compose references this host-maintained production Dockerfile.
+            test -f Dockerfile.production
+
+            # The persistent /app/data volume shadows image data. Keep the existing
+            # deployment behavior by updating tracked runtime resources in that volume.
+            cp -a data/. "$app_root/volumes/data/"
+
+            cd "$app_root"
+            docker compose build
+            docker compose up -d --remove-orphans
+
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --show-error http://127.0.0.1:10588/ > /dev/null; then
+                docker compose ps
+                echo "Deployment succeeded: $DEPLOY_SHA"
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "Deployment failed: service did not become healthy."
+            docker compose ps
+            docker compose logs --tail 100 toonflow-app
+            exit 1

@@ -23,9 +23,6 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - name: Create source archive
-        run: git archive --format=tar.gz --output=toonflow-release.tar.gz "${GITHUB_SHA}"
-
       - name: Configure verified SSH connection
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
@@ -44,16 +41,18 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
           DEPLOY_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
           DEPLOY_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SHA: ${{ github.sha }}
         run: |
-          ssh -p "$DEPLOY_PORT" -i ~/.ssh/toonflow_deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" 'mkdir -p /data/apps/toonflow-app/releases'
+          ssh -p "$DEPLOY_PORT" -i ~/.ssh/toonflow_deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" "set -e; app_root=/data/apps/toonflow-app; release_dir=\$app_root/releases/$DEPLOY_SHA; rm -rf \$release_dir; mkdir -p \$release_dir; cp -a \$app_root/app/. \$release_dir/"
 
-      - name: Upload source archive
+      - name: Synchronize changed source files
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
           DEPLOY_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
           DEPLOY_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SHA: ${{ github.sha }}
         run: |
-          scp -P "$DEPLOY_PORT" -i ~/.ssh/toonflow_deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes toonflow-release.tar.gz "$DEPLOY_USER@$DEPLOY_HOST:/data/apps/toonflow-app/releases/toonflow-release.tar.gz"
+          rsync -azc --delete --exclude='.git/' --exclude='Dockerfile.production' -e "ssh -p $DEPLOY_PORT -i ~/.ssh/toonflow_deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" ./ "$DEPLOY_USER@$DEPLOY_HOST:/data/apps/toonflow-app/releases/$DEPLOY_SHA/"
 
       - name: Switch release and verify health
         env:
@@ -68,16 +67,12 @@ jobs:
           app_root=/data/apps/toonflow-app
           app_dir="$app_root/app"
           releases_dir="$app_root/releases"
-          archive="$releases_dir/toonflow-release.tar.gz"
           release_dir="$releases_dir/$DEPLOY_SHA"
           previous_dir="$releases_dir/app-before-$DEPLOY_SHA"
           failed_dir="$releases_dir/app-failed-$DEPLOY_SHA"
 
-          test -f "$archive"
           test -f "$app_dir/Dockerfile.production"
-          mkdir -p "$release_dir"
-          tar -xzf "$archive" -C "$release_dir"
-          cp "$app_dir/Dockerfile.production" "$release_dir/Dockerfile.production"
+          test -f "$release_dir/Dockerfile.production"
 
           mv "$app_dir" "$previous_dir"
           mv "$release_dir" "$app_dir"
